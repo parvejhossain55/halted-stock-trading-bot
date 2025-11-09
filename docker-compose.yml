@@ -1,0 +1,150 @@
+version: "3.8"
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:7.0
+    container_name: halt-detector-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme}
+      MONGO_INITDB_DATABASE: halt_detector
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    networks:
+      - halt-detector-network
+
+  # Redis for caching and task queue
+  redis:
+    image: redis:7-alpine
+    container_name: halt-detector-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - halt-detector-network
+
+  # Python Backend Data Pipeline
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: halt-detector-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=${DEBUG:-False}
+      - SECRET_KEY=${SECRET_KEY:-changeme-in-production}
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DB=halt_detector
+      - MONGO_USER=admin
+      - MONGO_PASSWORD=${MONGO_PASSWORD:-changeme}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POLYGON_API_KEY=${POLYGON_API_KEY}
+      - DAS_API_ENDPOINT=${DAS_API_ENDPOINT}
+      - DAS_API_KEY=${DAS_API_KEY}
+      - PAPER_TRADING_MODE=${PAPER_TRADING_MODE:-True}
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - halt-detector-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker for async tasks
+  celery-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: halt-detector-celery-worker
+    restart: unless-stopped
+    environment:
+      - DEBUG=${DEBUG:-False}
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DB=halt_detector
+      - MONGO_USER=admin
+      - MONGO_PASSWORD=${MONGO_PASSWORD:-changeme}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POLYGON_API_KEY=${POLYGON_API_KEY}
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - mongodb
+      - redis
+      - backend
+    networks:
+      - halt-detector-network
+    command: celery -A backend worker -l info
+
+  # Celery Beat for scheduled tasks
+  celery-beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: halt-detector-celery-beat
+    restart: unless-stopped
+    environment:
+      - DEBUG=${DEBUG:-False}
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DB=halt_detector
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    depends_on:
+      - mongodb
+      - redis
+      - backend
+    networks:
+      - halt-detector-network
+    command: celery -A backend beat -l info
+
+  # Nginx Reverse Proxy (Production)
+  nginx:
+    image: nginx:alpine
+    container_name: halt-detector-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+    networks:
+      - halt-detector-network
+    profiles:
+      - production
+
+volumes:
+  mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  halt-detector-network:
+    driver: bridge
